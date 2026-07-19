@@ -1,0 +1,157 @@
+'use strict';
+
+/**
+ * Scans a list of Solana public keys against unclaimedsol.com's reward
+ * scan endpoint and saves any wallets that show unclaimed "dust" to a
+ * results file.
+ *
+ * Usage:
+ *   node scan-dust.js pubkeys.txt
+ *
+ * Input file: one public key per line (blank lines / lines starting
+ * with # are ignored).
+ *
+ * Output:
+ *   results-with-dust.json  -> array of { publicKey, total, displaySolEquivalentLamports, isLikelyProfitable, raw }
+ *   scan.log                -> simple progress log
+ */
+
+const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
+
+const API_URL = 'https://unclaimedsol.com/api/rewards/scan';
+const REQ_PER_SEC = 5;               // rate limit
+const DELAY_MS = 1000 / REQ_PER_SEC; // spacing between requests
+const TIMEOUT_MS = 15000;
+const MAX_RETRIES = 2;
+
+const inputFile = process.argv[2];
+if (!inputFile) {
+  console.error('Usage: node scan-dust.js <pubkeys.txt>');
+  process.exit(1);
+}
+
+const outputFile = path.join(process.cwd(), 'results-with-dust.json');
+const logFile = path.join(process.cwd(), 'scan.log');
+
+function log(msg) {
+  const line = `[${new Date().toISOString()}] ${msg}`;
+  console.log(line);
+  fs.appendFileSync(logFile, line + '\n');
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readPubkeys(file) {
+  const rl = readline.createInterface({
+    input: fs.createReadStream(file),
+    crlfDelay: Infinity,
+  });
+  const keys = [];
+  for await (const raw of rl) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    keys.push(line);
+  }
+  return keys;
+}
+
+async function scanOne(publicKey, attempt = 1) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    const res = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'sec-ch-ua-platform': '"macOS"',
+        'Referer': 'https://unclaimedsol.com/',
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'sec-ch-ua': '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+        'Content-Type': 'application/json',
+        'sec-ch-ua-mobile': '?0',
+      },
+      body: JSON.stringify({ publicKey }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    return data;
+  } catch (err) {
+    clearTimeout(timeout);
+    if (attempt <= MAX_RETRIES) {
+      log(`  retrying ${publicKey} (attempt ${attempt + 1}) after error: ${err.message}`);
+      await sleep(500 * attempt);
+      return scanOne(publicKey, attempt + 1);
+    }
+    throw err;
+  }
+}
+
+function hasDust(result) {
+  // total / displaySolEquivalentLamports are strings of lamports.
+  const total = Number(result.total || '0');
+  const display = Number(result.displaySolEquivalentLamports || '0');
+  return total > 0 || display > 0;
+}
+
+async function main() {
+  const keys = await readPubkeys(inputFile);
+  log(`Loaded ${keys.length} public keys from ${inputFile}`);
+  log(`Rate limit: ${REQ_PER_SEC} req/sec (~${DELAY_MS.toFixed(0)}ms between requests)`);
+
+  const withDust = [];
+  let errors = 0;
+
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    const start = Date.now();
+
+    try {
+      const result = await scanOne(key);
+
+      if (hasDust(result)) {
+        log(`[${i + 1}/${keys.length}] ${key} -> DUST FOUND (total=${result.total}, display=${result.displaySolEquivalentLamports}, netAfterFees=${result.estimatedNetAfterFeesLamports}, profitable=${result.isLikelyProfitable})`);
+        withDust.push({
+          publicKey: key,
+          total: result.total,
+          displaySolEquivalentLamports: result.displaySolEquivalentLamports,
+          estimatedNetAfterFeesLamports: result.estimatedNetAfterFeesLamports,
+          isLikelyProfitable: result.isLikelyProfitable,
+          raw: result,
+        });
+        // Save incrementally so you don't lose progress on a crash
+        fs.writeFileSync(outputFile, JSON.stringify(withDust, null, 2));
+      } else {
+        log(`[${i + 1}/${keys.length}] ${key} -> clean`);
+      }
+    } catch (err) {
+      errors++;
+      log(`[${i + 1}/${keys.length}] ${key} -> ERROR: ${err.message}`);
+    }
+
+    // Maintain rate limit regardless of how long the request took
+    const elapsed = Date.now() - start;
+    const wait = DELAY_MS - elapsed;
+    if (wait > 0) await sleep(wait);
+  }
+
+  log(`Done. ${withDust.length} wallet(s) with dust, ${errors} error(s).`);
+  log(`Results saved to ${outputFile}`);
+}
+
+main().catch((err) => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});
